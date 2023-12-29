@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+
+import bech32
+import json
+import argparse
+import subprocess
+import re
+import os
+import sys
+import base64
+import binascii
+from datetime import datetime, timedelta, timezone
+
+try:
+    subprocess.run(["grpcurl", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+except subprocess.CalledProcessError:
+    print("grpcurl is required but not installed.")
+    print("You can install grpcurl on Linux with following command:")
+    print("curl -sSL \"https://github.com/fullstorydev/grpcurl/releases/download/v1.8.6/grpcurl_1.8.6_linux_x86_64.tar.gz\" | tar -xz -C /usr/local/bin")
+
+parser = argparse.ArgumentParser(description="""
+This script searches for files which could be potentially spacemesh node configurations.
+It then extracts the GRPC socket from these files and queries the nodes for their
+eligible layers. The layers are written to a JSON file which can be directly imported
+in the Spacemesh App Tracker for mobile phones.
+""")
+
+parser.add_argument(
+    "--search-root",
+    help="Root directory for node config search. Default is current directory.",
+    default=".",
+    action="store",
+)
+parser.add_argument(
+    "--search-depth",
+    help="Define max. recursive depth for node config search. Default is 5.",
+    default=5,
+    type=int,
+    action="store",
+)
+parser.add_argument(
+    "--search-string",
+    help="""Provide a string which identifies node config files (e.g. node-config.json).
+    Default is .json which will result in searching for all json files.""",
+    default=".json",
+    action="store",
+)
+args = parser.parse_args()
+
+def base64_to_hex(base64_string):
+    decoded_bytes = base64.b64decode(base64_string)
+    hex_result = binascii.hexlify(decoded_bytes).decode('utf-8')
+    return hex_result
+
+
+def get_current_epoch():
+    genesis_date = datetime(2023, 7, 14, 8, 0, tzinfo=timezone.utc)  # genesis
+    current_date = datetime.now(timezone.utc)
+    time_since_genesis = current_date - genesis_date
+    current_layer = int(time_since_genesis.total_seconds() / 60 / 5)
+    return int(current_layer / 4032)
+
+
+def is_json_file(file_path):
+    try:
+        with open(file_path, 'r') as file:
+            json.load(file)
+        return True
+    except (json.JSONDecodeError, FileNotFoundError):
+        return False
+
+
+def find_files(search_string, search_root, max_depth):
+    result = []
+    for root, dirs, files in os.walk(search_root, followlinks=True):
+        current_depth = root[len(search_root):].count(os.sep)
+        if current_depth >= max_depth:
+            continue
+        
+        for file in files:
+            if file.endswith(search_string):
+                full_path = os.path.abspath(os.path.join(root, file))
+                if is_json_file(full_path):
+                    result.append(full_path)
+    return result
+
+
+def get_events_stream(grpc_socket):
+    cmd = ["timeout", "0.5s", "grpcurl", "-plaintext", "-d", "{}", grpc_socket, "spacemesh.v1.AdminService.EventsStream"]
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except subprocess.CalledProcessError as e:
+        output = e.output
+    return output
+
+
+def split_stream_blocks(stream):
+    blocks = []
+    count = 0
+    start = 0
+    for i, char in enumerate(stream):
+        if char == '{':
+            count += 1
+        elif char == '}':
+            count -= 1
+            if count == 0:
+                blocks.append(stream[start:i+1])
+                start = i+1
+    return blocks
+
+
+def get_eligible_layers(grpc_socket, epoch):
+    stream = get_events_stream(grpc_socket)
+    blocks = split_stream_blocks(stream)
+    
+    node_id = None
+    for block in blocks:
+        if "smesher" in block and "initStart" in block:
+            j = json.loads(block)
+            node_id = j["initStart"]["smesher"]
+            node_id = base64_to_hex(node_id)
+            break
+        
+    if not node_id:
+        return None
+    
+    layers = []
+    for block in blocks:
+        if not "eligibilities" in block:
+            continue
+        j = json.loads(block)
+        if j["eligibilities"]["epoch"] != epoch:
+            continue
+        for e in j["eligibilities"]["eligibilities"]:
+            layers.append([e["layer"], e["count"]])
+    return [node_id, sorted(layers)]
+
+
+def get_node_grpc_socket(node_config):
+    try:
+        with open(node_config, 'r') as f:
+            j = json.load(f)
+        return j["api"]["grpc-private-listener"]
+    except (json.JSONDecodeError, FileNotFoundError, KeyError, TypeError):
+        return None
+
+
+print(f"Searching for node configuration files (files matching {args.search_string})")
+file_matches=find_files(args.search_string, args.search_root, args.search_depth)
+print("")
+
+layers_export = {}
+node_counter = 0
+layer_counter = 0
+for fn in file_matches:
+    socket = get_node_grpc_socket(fn)
+    if not socket:
+        continue
+    el = get_eligible_layers(socket, get_current_epoch())
+    if el:
+        node_counter += 1
+        node_id, el = el
+        print("Node ID:", node_id)
+        print("Config file:", fn)
+        if node_id in layers_export:
+            print("Node ID was already queried. Skipping ...\n")
+            continue
+        print("Eligible layers:", el, "\n")
+        layers = []
+        for l in el:
+            layer_counter += l[1]
+            layers.append({"layer": l[0], "count": l[1]})
+        layers_export[node_id] = layers
+
+if layers_export:
+    print(f"Retrieved {layer_counter} layers eligible for rewards from {node_counter} nodes.")
+    print("Writing results to layers.json ...")
+    with open("layers.json", 'w') as json_file:
+        json.dump(layers_export, json_file, indent=4)
+else:
+    print("Could not find any nodes.")
+
