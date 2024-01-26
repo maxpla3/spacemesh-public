@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# We assume that all your nodes are located in /path/to/pools, e.g.
+# /path/to/pools/node_01
+# /path/to/pools/node_02
+# ...
+# Also, there is a config file for each pool in which the ports are defined and which resided e.g. in
+# /path/to/pools/node_01/node-config.json
+nodePool=/path/to/pools
+
+echo " Node  | Version | Sync | Peers | Synced | Top    | Verified | GiB   | CG  | Challenge      | ATX "
+echo "------------------------------------------------------------------------------------------------------------"
+
+for d in ${nodePool}/node_*; do
+    #i=$(echo $d | awk '{print substr($1,length($1)-1) }')
+    i=$(echo $d | cut -d "_" -f 2)
+    
+    if ! [[ $i =~ ^-?[0-9]+$ ]]; then
+        continue
+    fi
+
+    iz=${i#0}
+    grpc_public=$((iz + 9000))
+    grpc_private=$((iz + 9300))
+    grpc_json=$((iz + 9600))
+
+    response=$(grpcurl -plaintext -d '{}' 0.0.0.0:${grpc_public} spacemesh.v1.NodeService.Version 2>/dev/null)
+    ver=$(echo $response | jq -r '.versionString.value')
+    response=$(grpcurl -plaintext -d '{}' 0.0.0.0:${grpc_public} spacemesh.v1.NodeService.Status 2>/dev/null)
+    isSynced=$(echo $response | jq -r '.status.isSynced')
+    if [ "$isSynced" == "null" ]; then
+        isSynced="NO"
+    elif [ "$isSynced" == "true" ]; then
+        isSynced="YES"
+    fi
+    peers=$(echo $response | jq -r '.status.connectedPeers')
+    syncedLayer=$(echo $response | jq -r '.status.syncedLayer.number')
+    topLayer=$(echo $response | jq -r '.status.topLayer.number')
+    verifiedLayer=$(echo $response | jq -r '.status.verifiedLayer.number')
+    response=$(grpcurl -plaintext -d '{}' 0.0.0.0:${grpc_private} spacemesh.v1.SmesherService.PostSetupStatus 2>/dev/null)
+    su=$(echo $response | jq -r '.status.opts.numUnits')
+    postSize=$((su * 64))
+    cycleGap=$(cat "${d}/node-config.json" | grep "cycle-gap" | awk -F'"' '{print $4}')
+
+    if [ -f "${d}/${logFile}" ]; then
+        submitted_date=$(tac ${d}/${logFile} | grep -m 1 "challenge submitted to poet proving service" | awk '{print $1}' | awk -F"T" '{print $1 " " $2}' | awk -F"." '{print $1}' | xargs -I {} date -d {} +"%d.%m.%y %H:%M")
+        atx_pub_date=$(tac ${d}/${logFile} | grep -m 1 "atx published" | awk '{print $1}' | awk -F"T" '{print $1 " " $2}' | awk -F"." '{print $1}' | xargs -I {} date -d {} +"%d.%m.%y %H:%M")
+    fi
+
+    [ -z "$su" ] && postSize=""
+    printf "  %-4s | %-7s | %-4s | %-5s | %-6s | %-6s | %-8s | %-5s | %-3s | %-14s | %-14s \n" "$i" "$ver" "$isSynced" "$peers" "$syncedLayer" "$topLayer" "$verifiedLayer" "$postSize" "$cycleGap" "$submitted_date" "$atx_pub_date"
+done
