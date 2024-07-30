@@ -47,7 +47,7 @@ conn.close()
 
 total_rewards = 0
 with open("rewards.csv", mode='w') as file:
-    file.write("year, month, day, time, layer, reward (SMH)\n")
+    file.write("#year, month, day, time, layer, reward (SMH)\n")
     for layer, reward in results:
         file.write(f"{layer_timestamp(layer)},{layer},{reward}\n")
         total_rewards += reward
